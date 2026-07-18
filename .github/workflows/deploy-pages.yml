@@ -1,0 +1,113 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout content
+        uses: actions/checkout@v4
+
+      - name: Checkout builder
+        uses: actions/checkout@v4
+        with:
+          repository: Mazek27/mazcode-web-builder
+          path: builder
+          token: ${{ secrets.BUILDER_ACCESS_TOKEN }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: builder/package-lock.json
+
+      - name: Install dependencies
+        run: cd builder && npm ci
+
+      - name: Copy content + config + forms
+        # Builder expects this layout under `builder/content/`:
+        #   <root>/<page>.json              from tenant content/
+        #   <root>/config/<file>.json       from tenant config/
+        #   <root>/forms/<file>.json        from tenant forms/
+        run: |
+          rm -rf builder/content
+          mkdir -p builder/content
+          if [ -d "${{ github.workspace }}/content" ]; then
+            cp -r ${{ github.workspace }}/content/. builder/content/
+          fi
+          if [ -d "${{ github.workspace }}/config" ]; then
+            mkdir -p builder/content/config
+            cp -r ${{ github.workspace }}/config/. builder/content/config/
+          fi
+          if [ -d "${{ github.workspace }}/forms" ]; then
+            mkdir -p builder/content/forms
+            cp -r ${{ github.workspace }}/forms/. builder/content/forms/
+          fi
+          # Static assets (media WebP, OG images, favicons) go RAW (unencrypted)
+          # to builder/public/images/ → served at /images/* on the static export.
+          #   <root>/images/<file>   from tenant images/  → served at /images/<file>
+          # Drift fix: previously only sync-site.mjs's workflow template had this
+          # step, so a publish via publishSite() shipped without the images.
+          if [ -d "${{ github.workspace }}/images" ]; then
+            mkdir -p builder/public/images
+            cp -r ${{ github.workspace }}/images/. builder/public/images/
+          fi
+
+      - name: Decrypt content
+        # decrypts builder/content/*.mcz + builder/content/{config,forms}/*.mcz
+        run: cd builder && node scripts/crypto/decrypt-content.mjs content
+        env:
+          CONTENT_ENCRYPTION_KEY: ${{ secrets.CONTENT_ENCRYPTION_KEY }}
+
+      - name: Build static site
+        run: cd builder && npm run build:pages
+        env:
+          NEXT_PUBLIC_SITE_URL: https://${{ vars.SITE_DOMAIN }}${{ vars.PAGES_BASE_PATH }}
+          NEXT_PUBLIC_FORM_API_URL: ${{ vars.FORM_API_URL }}
+          NEXT_PUBLIC_TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+          # SHORT-path proxy hosts (api./mail.mazcode.pl) strip the /api/forms
+          # convention via next.config rewrites; '1' makes getFormSubmitUrl emit
+          # <base>/<tenant>/<form>. Empty for full-path hosts (admin.mazcode.pl).
+          NEXT_PUBLIC_FORM_API_SHORT: ${{ vars.FORM_API_SHORT }}
+          # Analytics (GA4/Hotjar/PostHog) comes ONLY from config/site.json analytics block, never env.
+          CONTENT_ENCRYPTION_KEY: ${{ secrets.CONTENT_ENCRYPTION_KEY }}
+          # Dummy Auth0 vars — required for top-level Auth0Client instantiation
+          # during static build, but admin/API routes are not emitted in export.
+          AUTH0_DOMAIN: dummy.auth0.com
+          AUTH0_CLIENT_ID: dummy-client-id
+          AUTH0_CLIENT_SECRET: dummy-client-secret-min-32-chars-long
+          AUTH0_SECRET: 0000000000000000000000000000000000000000000000000000000000000000
+          APP_BASE_URL: https://${{ vars.SITE_DOMAIN }}${{ vars.PAGES_BASE_PATH }}
+          PAGES_BASE_PATH: ${{ vars.PAGES_BASE_PATH }}
+          # Inlined into client bundles so ContentImage prepends the subpath to CMS
+          # image srcs (/images/*); without it images 404 on a github.io subpath deploy.
+          NEXT_PUBLIC_PAGES_BASE_PATH: ${{ vars.PAGES_BASE_PATH }}
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: builder/out
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
